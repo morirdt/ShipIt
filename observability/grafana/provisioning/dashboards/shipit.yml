@@ -1,0 +1,12 @@
+# Loads every dashboard JSON in /var/lib/grafana/dashboards.
+# The JSON in observability/grafana/dashboards/ is the source of truth;
+# UI edits can't be saved (allowUiUpdates: false).
+apiVersion: 1
+
+providers:
+  - name: shipit
+    type: file
+    disableDeletion: true
+    allowUiUpdates: false
+    options:
+      path: /var/lib/grafana/dashboards

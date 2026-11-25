@@ -1,0 +1,11 @@
+# Local Prometheus. In AWS the ADOT sidecar does this scrape (every 30s) and
+# remote-writes to Amazon Managed Prometheus instead.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: shipit-api
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["app:8000"]
