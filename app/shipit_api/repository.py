@@ -92,7 +92,7 @@ def get_repository() -> NotesRepository:
     dynamodb = boto3.resource(
         "dynamodb",
         region_name=settings.aws_region,
-        endpoint_url=settings.dynamodb_endpoint_url,
+        endpoint_url=settings.dynamodb_endpoint,
         config=_BOTO_CONFIG,
     )
-    return NotesRepository(dynamodb.Table(settings.notes_table_name))
+    return NotesRepository(dynamodb.Table(settings.table_name))

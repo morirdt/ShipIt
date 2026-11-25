@@ -8,6 +8,7 @@ dependencies = [
     "uvicorn[standard]>=0.32",
     "boto3>=1.35",
     "pydantic-settings>=2.6",
+    "prometheus-fastapi-instrumentator>=8.1.0",
 ]
 
 [dependency-groups]
@@ -15,6 +16,7 @@ dev = [
     "pytest>=8.3",
     "moto[dynamodb]>=5.0",
     "httpx2>=2.16.2",
+    "ruff>=0.17.6",
 ]
 
 [tool.uv]

@@ -1,12 +1,27 @@
+import logging
 from typing import Annotated
 
 from fastapi import Depends, FastAPI, HTTPException, Response, status
+from prometheus_client import Counter
+from prometheus_fastapi_instrumentator import Instrumentator
 
 from shipit_api.config import Settings, get_settings
+from shipit_api.logging_config import configure_logging
 from shipit_api.models import Note, NoteCreate, NoteUpdate
 from shipit_api.repository import NoteNotFoundError, NotesRepository, get_repository
 
+configure_logging()
+logger = logging.getLogger("shipit_api")
+
 app = FastAPI(title="ShipIt API")
+
+# RED metrics per route: http_requests_total{handler,method,status} and
+# http_request_duration_seconds{handler,method}. The `handler` label is the route
+# *template* (/notes/{note_id}), never the raw path, so cardinality stays bounded.
+# Untemplated paths (404 scans etc.) are collapsed into handler="none".
+Instrumentator(excluded_handlers=["/metrics"]).instrument(app).expose(app, include_in_schema=False)
+
+NOTES_CREATED = Counter("notes_created_total", "Notes successfully created.")
 
 Repo = Annotated[NotesRepository, Depends(get_repository)]
 
@@ -24,12 +39,15 @@ def health() -> dict[str, str]:
 
 @app.get("/version")
 def version(settings: Annotated[Settings, Depends(get_settings)]) -> dict[str, str]:
-    return {"git_sha": settings.git_sha}
+    return {"version": settings.app_version}
 
 
 @app.post("/notes", status_code=status.HTTP_201_CREATED)
 def create_note(data: NoteCreate, repo: Repo) -> Note:
-    return repo.create(data)
+    note = repo.create(data)
+    NOTES_CREATED.inc()
+    logger.info("note created", extra={"note_id": note.id})
+    return note
 
 
 @app.get("/notes")
