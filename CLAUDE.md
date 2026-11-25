@@ -4,7 +4,7 @@ Guidance for Claude Code when working in this repository. Read this file first i
 
 ## What this project is
 
-ShipIt is a **learning and portfolio project**. It's a small Python FastAPI service deployed to AWS ECS Fargate behind an Application Load Balancer. All infrastructure is in Terraform, and every change ships through GitHub Actions. GitHub authenticates to AWS with OIDC, so no AWS keys are stored anywhere.
+ShipIt is a **learning and portfolio project**. It's a small Python FastAPI service deployed to AWS ECS Fargate behind an Application Load Balancer. All infrastructure is in Terraform, and every change ships through GitHub Actions. Humans use only temporary credentials. CI holds only access keys that can do nothing except assume one scoped role each, because this account type blocks OIDC identity providers.
 
 The owner (Mori) is a DevOps engineer with OpenShift, GitLab CI, Helm, Argo, Prometheus and Grafana experience. He is building this to learn **AWS, Terraform, AWS networking and GitHub Actions** well enough to explain every design decision in a job interview.
 
@@ -23,11 +23,11 @@ Users ──HTTP:80──▶ ALB (2 public subnets, 2 AZs) ──▶ ECS Fargate
                                                        └─ ADOT collector sidecar ──remote write──▶ Amazon Managed Prometheus
 Tasks ──▶ ECR (images) · DynamoDB (notes table) · CloudWatch (logs, alarms)
 Grafana (local, docker compose) ──SigV4──▶ AMP query endpoint
-GitHub Actions ──OIDC──▶ IAM roles (plan: read-only on PRs, apply: gated by `production` environment)
-Bootstrap (applied once, locally): S3 state bucket + GitHub OIDC provider + CI roles
+GitHub Actions ──assume-only key──▶ IAM roles (plan: read-only on PRs, apply: key lives in the approval-gated `production` environment)
+Bootstrap (applied once, locally): S3 state bucket + CI roles + assume-only CI users
 ```
 
-- **Region:** `eu-north-1`, the only Region the AWS-managed project SCP allows (set once in `infra/envs/dev/terraform.tfvars`; don't hard-code it elsewhere).
+- **Region:** `eu-north-1`. This is the project's Region in AWS Settings and the only Region the AWS-managed project SCP allows (every other Region returns an explicit SCP deny; see `INTERVIEW.md`). Set it once in `infra/envs/dev/terraform.tfvars` and never hard-code it elsewhere. Free plan projects can't use multi-Region features. Before using a new service, check that it's on AWS's list of services the new experience supports.
 - **VPC:** `10.0.0.0/16`, public subnets `10.0.1.0/24` and `10.0.2.0/24`. **No NAT Gateway, no private subnets** (ADR-001: cost).
 - **Security groups:** `alb-sg` allows 80/443 from the internet. `app-sg` allows 8000 **only from `alb-sg`** (reference the security group, not a CIDR).
 - **IAM:** task *execution* role (ECR pull, logs) is separate from task role (DynamoDB on this one table, `aps:RemoteWrite` on this one workspace).
@@ -39,7 +39,7 @@ shipit/
 ├── app/                  # FastAPI service, tests, Dockerfile
 ├── observability/        # prometheus.yml, adot-config.yaml, grafana/ provisioning + dashboard JSON
 ├── infra/
-│   ├── bootstrap/        # one-time: state bucket, OIDC provider, CI roles (local state, applied from laptop)
+│   ├── bootstrap/        # one-time: state bucket, CI roles, assume-only CI users (local state, applied from laptop)
 │   ├── modules/
 │   │   ├── network/      # VPC, subnets, IGW, routes, security groups
 │   │   └── service/      # ECR, ECS, ALB, DynamoDB, AMP, IAM, logs, alarms, dashboard
@@ -66,12 +66,25 @@ Prefer `make` targets; add one when a new repeatable command appears.
 | Plan dev | `make plan` (`cd infra/envs/dev && terraform plan -out=tfplan`) |
 | All pre-commit hooks | `pre-commit run --all-files` |
 
-AWS CLI uses the profile `dev` with short-lived credentials from a console sign-in: `aws login --profile dev`, then `export AWS_PROFILE=dev`. **No IAM user access keys**, not even on the laptop.
+AWS CLI login (AWS CLI ≥ 2.32): `aws login --profile dev`, then `export AWS_PROFILE=dev`. `aws sts get-caller-identity` shows `assumed-role/AccountFullAccessRole/...`. Never suggest `aws configure sso` or `aws configure` with access keys for Mori.
 
-The account was created with AWS's **new sign-up experience** (a "project" account). AWS runs the Organization and its SCPs for you until "advanced features" are activated. Activation can't be undone, needs the Paid plan and removes the spend limit. Consequences (see `INTERVIEW.md`):
-- The project is pinned to **one Region (`eu-north-1`)**. Every other Region is denied by an SCP.
-- IAM Identity Center and AWS Organizations aren't available, so use `aws login`, not SSO.
-- Before using a new service, check it's on AWS's list of services supported by the new experience.
+## Identity and access model
+
+This account is on **AWS's new "projects" experience** (Builder ID login, AWS Settings), on the Free plan. AWS applies fixed guardrail SCPs that cannot be changed. In this account you **cannot** create IAM groups, console logins for IAM users, OIDC/SAML identity providers (`iam:*Provider*`), account aliases, or IAM Identity Center. Never suggest these, and never suggest "activate advanced features" (irreversible, removes the spend limit). Roles, policies, IAM users without console access, and access keys are allowed. Don't create roles under the `/managed/` path.
+
+| Who | Identity | How credentials are obtained | Lifetime |
+|---|---|---|---|
+| Mori (laptop + console) | AWS Builder ID → `AccountFullAccessRole` (admin, managed by AWS) | Console login; `aws login --profile dev` for CLI/Terraform | Auto-refreshed, up to 12 h |
+| CI, PR jobs | IAM user `github-ci-plan` (no console, one access key) → role `shipit-plan` | Key stored in GitHub environment `plan` → `configure-aws-credentials` with `role-to-assume` | ~1 h per job |
+| CI, apply/deploy jobs | IAM user `github-ci-apply` (no console, one access key) → role `shipit-apply` | Key stored in GitHub environment `production` (requires Mori's approval) | ~1 h per job |
+| App in ECS | Task role (app) + task execution role (ECS agent) | Provided by ECS | Rotated automatically |
+
+- Each CI user's **only** permission is `sts:AssumeRole` on its one role. Each role's trust policy trusts only its own CI user ARN. All real permissions live on the roles.
+- CI keys live only in GitHub **environment** secrets, never repository-level secrets, code or logs. Rotate every 90 days, and keep GitHub secret scanning enabled.
+- Don't create IAM users or roles for Mori; his Builder ID session is already the admin.
+- Why not OIDC: blocked by the project guardrail `iam:*Provider*`. This is documented in ADR-003. When explaining CI auth, note that OIDC is the standard elsewhere.
+- Terraform state is read and written directly from CI. The **apply role** needs `s3:GetObject/PutObject/DeleteObject` on `dev/terraform.tfstate` and `dev/terraform.tfstate.tflock`, plus `s3:ListBucket` on the bucket. The **plan role** is read-only on resources and state, but still needs put/delete on the `.tflock` key, because `terraform plan` takes the lock.
+- Later hardening: use IAM Access Analyzer policy generation (from CloudTrail activity) to replace broad permissions on `shipit-apply` with only what it actually used.
 
 ## Rules: safety and cost
 
@@ -79,7 +92,7 @@ These are hard rules. Follow them even if a task seems to need otherwise, and as
 
 1. **Never run `terraform apply`, `terraform destroy`, or any AWS CLI command that creates, changes or deletes resources without Mori's explicit confirmation in the chat.** `plan`, `validate`, `fmt` and read-only `aws ... describe/list/get` are fine.
 2. **Never create a NAT Gateway, Elastic IP, EKS cluster, or anything with a fixed hourly cost** not already in the spec. If a fix seems to need one, stop and explain the cost first.
-3. **No long-lived credentials anywhere.** No AWS access keys in code, `.env` files, GitHub secrets or workflow files. CI uses OIDC only. Never print or echo credentials or tokens.
+3. **Minimal long-lived credentials.** The only access keys allowed are one per assume-only CI user, stored only in GitHub environment secrets. Never create other access keys, never put keys in code, `.env` files, repository secrets or workflow files, and never print or echo credentials or tokens. Humans use `aws login`.
 4. **Least privilege.** Every IAM policy names specific actions and specific resource ARNs. `*` on actions or resources needs a comment explaining why (e.g. `ecr:GetAuthorizationToken`).
 5. **State bucket and bootstrap are protected.** Keep `prevent_destroy` on the state bucket. Don't change `infra/bootstrap/` without asking.
 6. Remind Mori to destroy the dev stack at the end of a working session (`destroy.yml` or `terraform destroy`). The ALB and public IPv4 addresses bill hourly.
@@ -113,11 +126,12 @@ These are hard rules. Follow them even if a task seems to need otherwise, and as
 ### GitHub Actions (`.github/workflows/`)
 
 - `ci.yml` (PRs): ruff → pytest → docker build → trivy image scan (fail on HIGH/CRITICAL).
-- `deploy.yml` (push to `main`, app paths): OIDC → ECR login → build, tag `${{ github.sha }}`, push → render task definition → deploy with `wait-for-service-stability: true` → smoke test that `/version` returns the new SHA.
-- `infra.yml` (infra paths): on PR, fmt/validate/tflint/trivy config, then `plan` with the **plan role**, posted as a PR comment. On merge, `apply` with the **apply role** in the `production` environment (requires approval).
+- `deploy.yml` (push to `main`, app paths): job in `production` environment → `configure-aws-credentials` (apply user key + `role-to-assume`) → ECR login → build, tag `${{ github.sha }}`, push → render task definition → deploy with `wait-for-service-stability: true` → smoke test that `/version` returns the new SHA.
+- `infra.yml` (infra paths): on PR, fmt/validate/tflint/trivy config, then `plan` with the **plan role** (job in the `plan` environment), posted as a PR comment. On merge, `apply` with the **apply role** (job in the `production` environment, which requires approval).
 - Nightly drift check: `terraform plan -detailed-exitcode`; exit code 2 fails the job.
 - `destroy.yml`: `workflow_dispatch` only, with a typed confirmation input.
-- Set `permissions:` at minimum (`id-token: write`, `contents: read`, add `pull-requests: write` only where commenting).
+- Set `permissions:` at minimum (`contents: read`; add `pull-requests: write` only where commenting). No `id-token: write`; OIDC isn't used.
+- Credentials step: `aws-actions/configure-aws-credentials` with `aws-access-key-id` / `aws-secret-access-key` from **environment** secrets, plus `role-to-assume`, `role-session-name: gh-${{ github.run_id }}` and `role-duration-seconds: 3600`.
 - **Pin third-party actions to a full commit SHA**, with the version in a comment.
 - Use `concurrency:` groups so deploys and applies never overlap.
 - Role ARNs and region go in workflow `env:` or repository **variables**, not secrets (they are not secret).
@@ -131,7 +145,7 @@ These are hard rules. Follow them even if a task seems to need otherwise, and as
 
 ### Docs
 
-- Every significant trade-off gets an ADR in `docs/adr/NNN-short-title.md`: Context, Decision, Consequences, Alternatives. Planned: 001 public subnets vs NAT, 002 ECS vs EKS, 003 OIDC vs access keys, 004 S3 native locking, 005 CloudWatch + AMP.
+- Every significant trade-off gets an ADR in `docs/adr/NNN-short-title.md`: Context, Decision, Consequences, Alternatives. Planned: 001 public subnets vs NAT, 002 ECS vs EKS, 003 assume-only CI keys (OIDC blocked by project guardrails), 004 S3 native locking, 005 CloudWatch + AMP.
 - README holds the architecture diagram, local run steps, CI/CD explanation, cost section and screenshots.
 
 ## Git workflow
@@ -145,9 +159,9 @@ These are hard rules. Follow them even if a task seems to need otherwise, and as
 
 Work **one phase at a time, in order**. At the start of a session, check this list. Then propose a short plan for the next unchecked step and wait for a go-ahead before writing lots of code. Tick items here when their "done when" is met.
 
-- [ ] **Phase 0 — Setup:** AWS account (Free plan, root MFA, `aws login` profile `dev` with no access keys, budgets), tools installed, repo with branch protection and pre-commit. *Done when:* `aws sts get-caller-identity --profile dev` works and a PR is blocked until checks pass.
+- [ ] **Phase 0 — Setup:** AWS account on the new projects experience (Builder ID login, Free plan, project region noted, `aws login` profile `dev`), tools installed, repo with branch protection and pre-commit. *Done when:* `aws sts get-caller-identity --profile dev` works and a PR is blocked until checks pass.
 - [ ] **Phase 1 — App:** FastAPI + tests + Dockerfile + compose with DynamoDB local, Prometheus, Grafana. *Done when:* `make up` serves `/health`, tests pass, Grafana on `localhost:3000` shows request rate and p95.
-- [ ] **Phase 2 — Bootstrap:** state bucket, GitHub OIDC provider, plan and apply roles with trust scoped to `repo:<owner>/shipit:...`. *Done when:* `terraform init` in `envs/dev` uses the S3 backend and concurrent plans wait on the lock.
+- [ ] **Phase 2 — Bootstrap:** state bucket; `shipit-plan` and `shipit-apply` roles with the S3 state permissions above (incl. the `.tflock` key for both); assume-only users `github-ci-plan` and `github-ci-apply`; keys stored in the GitHub `plan` and `production` environments (Mori creates the keys and pastes them into GitHub himself). *Done when:* `terraform init` in `envs/dev` uses the S3 backend and concurrent plans wait on the lock.
 - [ ] **Phase 3 — Network + ECR:** VPC, 2 public subnets, IGW, routes, SGs, ECR (Mori writes the network module). *Done when:* apply succeeds and every route and rule can be explained.
 - [ ] **Phase 4 — Service:** DynamoDB, log group, IAM roles, ECS cluster/task/service, ALB, circuit breaker; first image pushed by hand. *Done when:* `curl http://<alb-dns>/health` returns 200 and notes survive a task restart.
 - [ ] **Phase 5 — App CI/CD:** `ci.yml`, `deploy.yml`. *Done when:* a merged change is live in about 5 min with no manual steps.
