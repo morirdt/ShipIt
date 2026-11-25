@@ -61,7 +61,7 @@ Prefer `make` targets; add one when a new repeatable command appears.
 | Lint + format Python | `make lint` (`ruff check app && ruff format --check app`) |
 | Unit tests | `make test` (`pytest app/tests -q`) |
 | Build image | `make build` (`docker build -t shipit:local app`) |
-| Scan image | `make scan` (`trivy image --severity HIGH,CRITICAL --exit-code 1 shipit:local`) |
+| Scan image | `make scan` (`trivy image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 shipit:local`; unfixed base-image CVEs aren't actionable) |
 | Terraform fmt/validate/lint | `make tf-check` (`terraform fmt -check -recursive infra && tflint --recursive && trivy config infra`) |
 | Plan dev | `make plan` (`cd infra/envs/dev && terraform plan -out=tfplan`) |
 | All pre-commit hooks | `pre-commit run --all-files` |
@@ -125,7 +125,7 @@ These are hard rules. Follow them even if a task seems to need otherwise, and as
 
 ### GitHub Actions (`.github/workflows/`)
 
-- `ci.yml` (PRs): ruff → pytest → docker build → trivy image scan (fail on HIGH/CRITICAL).
+- `ci.yml` (PRs): ruff → pytest → docker build → trivy image scan (fail on fixable HIGH/CRITICAL, `--ignore-unfixed`).
 - `deploy.yml` (push to `main`, app paths): job in `production` environment → `configure-aws-credentials` (apply user key + `role-to-assume`) → ECR login → build, tag `${{ github.sha }}`, push → render task definition → deploy with `wait-for-service-stability: true` → smoke test that `/version` returns the new SHA.
 - `infra.yml` (infra paths): on PR, fmt/validate/tflint/trivy config, then `plan` with the **plan role** (job in the `plan` environment), posted as a PR comment. On merge, `apply` with the **apply role** (job in the `production` environment, which requires approval).
 - Nightly drift check: `terraform plan -detailed-exitcode`; exit code 2 fails the job.
