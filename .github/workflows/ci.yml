@@ -1,0 +1,68 @@
+# App CI on pull requests: ruff -> pytest -> docker build -> trivy image scan.
+# The job names ("lint-test", "image") are what the main ruleset requires as status checks.
+name: ci
+
+on:
+  pull_request:
+    branches: [main]
+
+# Read-only token: this workflow only checks code out. No AWS access, no id-token.
+permissions:
+  contents: read
+
+# A new push to the same PR cancels the older run.
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  lint-test:
+    runs-on: ubuntu-24.04
+    defaults:
+      run:
+        working-directory: app
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@1db35dd8eee11c5894872e0b383ae6c406cf738d # v10.4.0
+        with:
+          enable-cache: true
+          cache-dependency-glob: app/uv.lock
+
+      # --frozen: fail if uv.lock is out of date instead of silently re-resolving.
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Ruff
+        run: |
+          uv run ruff check --output-format=github .
+          uv run ruff format --check .
+
+      - name: Pytest
+        run: uv run pytest -q
+
+  image:
+    runs-on: ubuntu-24.04
+    needs: lint-test
+    env:
+      IMAGE: shipit:${{ github.sha }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Docker build
+        run: docker build --build-arg APP_VERSION=${{ github.sha }} -t "$IMAGE" app
+
+      # Trivy runs from its official image pinned by digest, rather than a
+      # third-party action, so nothing unpinned executes with the repo token.
+      # --ignore-unfixed: fail only on CVEs with an available fix. Unfixed Debian
+      # base-image CVEs would fail every build with nothing we can act on.
+      - name: Trivy image scan (fail on fixable HIGH/CRITICAL)
+        run: |
+          docker run --rm \
+            -v /var/run/docker.sock:/var/run/docker.sock:ro \
+            aquasec/trivy:0.76.2@sha256:8f6bb947dbc528902e11f2f5be52f7b519f6a39d5d148f41166f2040499768fb \
+            image --severity HIGH,CRITICAL --ignore-unfixed --exit-code 1 --no-progress "$IMAGE"
