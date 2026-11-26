@@ -41,6 +41,12 @@ ENV APP_VERSION=${APP_VERSION} \
 USER 10001
 EXPOSE 8000
 
+# Used by Docker / docker compose. ECS ignores it: on Fargate, health comes from the
+# ALB target group check (and optionally a task-definition healthCheck).
+# python instead of curl: the slim image has no curl, and adding it grows the attack surface.
+HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=2)"]
+
 # --no-server-header: don't advertise the server software.
 # --proxy-headers: trust X-Forwarded-For from the ALB for client IPs in access logs.
 CMD ["uvicorn", "shipit_api.main:app", "--host", "0.0.0.0", "--port", "8000", \
