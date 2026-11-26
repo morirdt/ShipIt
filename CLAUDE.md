@@ -24,10 +24,10 @@ Users ──HTTP:80──▶ ALB (2 public subnets, 2 AZs) ──▶ ECS Fargate
 Tasks ──▶ ECR (images) · DynamoDB (notes table) · CloudWatch (logs, alarms)
 Grafana (local, docker compose) ──SigV4──▶ AMP query endpoint
 GitHub Actions ──assume-only key──▶ IAM roles (plan: read-only on PRs, apply: key lives in the approval-gated `production` environment)
-Bootstrap (applied once, locally): S3 state bucket + CI roles + assume-only CI users
+Bootstrap (applied locally by Mori, never by CI): S3 state bucket + CI roles + assume-only CI users
 ```
 
-- **Region:** `eu-north-1`. This is the project's Region in AWS Settings and the only Region the AWS-managed project SCP allows (every other Region returns an explicit SCP deny; see `INTERVIEW.md`). Set it once in `infra/envs/dev/terraform.tfvars` and never hard-code it elsewhere. Free plan projects can't use multi-Region features. Before using a new service, check that it's on AWS's list of services the new experience supports.
+- **Region:** `eu-north-1`. This is the project's Region in AWS Settings and the only Region the AWS-managed project SCP allows (every other Region returns an explicit SCP deny; see `INTERVIEW.md`). Set it only in each root module's `terraform.tfvars` (`infra/bootstrap/`, `infra/envs/dev/`) and in the `backend.tf` blocks (backend blocks can't use variables), plus the `AWS_REGION` repository variable for workflows. Never hard-code it anywhere else. Free plan projects can't use multi-Region features. Before using a new service, check that it's on AWS's list of services the new experience supports.
 - **VPC:** `10.0.0.0/16`, public subnets `10.0.1.0/24` and `10.0.2.0/24`. **No NAT Gateway, no private subnets** (ADR-001: cost).
 - **Security groups:** `alb-sg` allows 80/443 from the internet. `app-sg` allows 8000 **only from `alb-sg`** (reference the security group, not a CIDR).
 - **IAM:** task *execution* role (ECR pull, logs) is separate from task role (DynamoDB on this one table, `aps:RemoteWrite` on this one workspace).
@@ -39,7 +39,7 @@ shipit/
 ├── app/                  # FastAPI service, tests, Dockerfile
 ├── observability/        # prometheus.yml, adot-config.yaml, grafana/ provisioning + dashboard JSON
 ├── infra/
-│   ├── bootstrap/        # one-time: state bucket, CI roles, assume-only CI users (local state, applied from laptop)
+│   ├── bootstrap/        # state bucket, CI roles, assume-only CI users (state in S3 under bootstrap/, applied from laptop only)
 │   ├── modules/
 │   │   ├── network/      # VPC, subnets, IGW, routes, security groups
 │   │   └── service/      # ECR, ECS, ALB, DynamoDB, AMP, IAM, logs, alarms, dashboard
@@ -79,11 +79,13 @@ This account is on **AWS's new "projects" experience** (Builder ID login, AWS Se
 | CI, apply/deploy jobs | IAM user `github-ci-apply` (no console, one access key) → role `shipit-apply` | Key stored in GitHub environment `production` (requires Mori's approval) | ~1 h per job |
 | App in ECS | Task role (app) + task execution role (ECS agent) | Provided by ECS | Rotated automatically |
 
-- Each CI user's **only** permission is `sts:AssumeRole` on its one role. Each role's trust policy trusts only its own CI user ARN. All real permissions live on the roles.
-- CI keys live only in GitHub **environment** secrets, never repository-level secrets, code or logs. Rotate every 90 days, and keep GitHub secret scanning enabled.
+- Each CI user (path `/ci/`) has **only** `sts:AssumeRole` + `sts:TagSession` on its one role (`TagSession` because `configure-aws-credentials` tags the session). Each role's trust policy trusts only its own CI user ARN. All real permissions live on the roles.
+- Access keys are never created in Terraform (the secret would be in state). They're created with the AWS CLI and piped straight into `gh secret set --env ...`, never printed.
+- CI keys live only in GitHub **environment** secrets, never repository-level secrets, code or logs. Rotate every 90 days (next due **2027-02-24**), and keep GitHub secret scanning and push protection enabled.
 - Don't create IAM users or roles for Mori; his Builder ID session is already the admin.
 - Why not OIDC: blocked by the project guardrail `iam:*Provider*`. This is documented in ADR-003. When explaining CI auth, note that OIDC is the standard elsewhere.
-- Terraform state is read and written directly from CI. The **apply role** needs `s3:GetObject/PutObject/DeleteObject` on `dev/terraform.tfstate` and `dev/terraform.tfstate.tflock`, plus `s3:ListBucket` on the bucket. The **plan role** is read-only on resources and state, but still needs put/delete on the `.tflock` key, because `terraform plan` takes the lock.
+- Terraform state is read and written directly from CI (bucket `shipit-tfstate-<account-id>`, SSE-S3, see ADR-004). Both roles have `s3:ListBucket` on the bucket and `s3:GetObject/PutObject/DeleteObject` on `dev/terraform.tfstate.tflock`, because `terraform plan` takes the lock too. The **plan role** can only `GetObject` the state file. The **apply role** can `GetObject/PutObject` it. Neither role has `DeleteObject` on the state file (Terraform never deletes it in plan/apply), and neither can touch `bootstrap/` keys.
+- The CI roles currently have **state access only**. Infrastructure permissions are added to `infra/bootstrap/` at the start of each phase, for only what that phase creates. The apply role must never be able to modify `shipit-plan`/`shipit-apply` or the CI users.
 - Later hardening: use IAM Access Analyzer policy generation (from CloudTrail activity) to replace broad permissions on `shipit-apply` with only what it actually used.
 
 ## Rules: safety and cost
@@ -112,7 +114,10 @@ These are hard rules. Follow them even if a task seems to need otherwise, and as
 ### Terraform (`infra/`)
 
 - Terraform `>= 1.10` (native S3 locking), AWS provider pinned with `~>` in `versions.tf`. Commit `.terraform.lock.hcl`.
-- Backend: S3 with `use_lockfile = true` and `encrypt = true`. **Don't use DynamoDB for locking** (deprecated).
+- Backend: S3 with `use_lockfile = true` and `encrypt = true`, one key per root (`bootstrap/terraform.tfstate`, `dev/terraform.tfstate`). **Don't use DynamoDB for locking** (deprecated).
+- Each root's provider sets `allowed_account_ids = [var.account_id]`. Root variables get values from `terraform.tfvars`, not `default`s.
+- IAM and S3 policies use `data "aws_iam_policy_document"`, not `jsonencode()`. Use `depends_on` only for dependencies no reference expresses, with a comment saying why.
+- Scanner suppressions (`# trivy:ignore:<ID> <reason>`) always carry a written reason, placed above the resource the finding points to.
 - One resource type's logic per file where sensible: `main.tf`, `variables.tf`, `outputs.tf`, `versions.tf`. Plus `iam.tf`, `alb.tf`, etc. in larger modules.
 - Every variable has `description` and `type`; add `validation` blocks for CIDRs and names. Every output has `description`.
 - Use `for_each` over `count` for anything keyed (subnets per AZ).
@@ -134,7 +139,8 @@ These are hard rules. Follow them even if a task seems to need otherwise, and as
 - Credentials step: `aws-actions/configure-aws-credentials` with `aws-access-key-id` / `aws-secret-access-key` from **environment** secrets, plus `role-to-assume`, `role-session-name: gh-${{ github.run_id }}` and `role-duration-seconds: 3600`.
 - **Pin third-party actions to a full commit SHA**, with the version in a comment.
 - Use `concurrency:` groups so deploys and applies never overlap.
-- Role ARNs and region go in workflow `env:` or repository **variables**, not secrets (they are not secret).
+- Role ARNs and region go in workflow `env:` or repository **variables**, not secrets (they are not secret). Existing repository variables: `AWS_REGION`, `AWS_PLAN_ROLE_ARN`, `AWS_APPLY_ROLE_ARN`. Environment secrets (in both `plan` and `production`): `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`.
+- Environments: `plan` has no protection rules (PR branches must be able to use it; the role is read-only). `production` requires Mori's approval (`prevent_self_review: false`, he's the only reviewer) and only allows deployments from `main`.
 
 ### Observability (`observability/`)
 
@@ -161,7 +167,7 @@ Work **one phase at a time, in order**. At the start of a session, check this li
 
 - [x] **Phase 0 — Setup:** AWS account on the new projects experience (Builder ID login, Free plan, project region noted, `aws login` profile `dev`), tools installed, repo with branch protection and pre-commit. *Done when:* `aws sts get-caller-identity --profile dev` works and a PR is blocked until checks pass.
 - [x] **Phase 1 — App:** FastAPI + tests + Dockerfile + compose with DynamoDB local, Prometheus, Grafana. *Done when:* `make up` serves `/health`, tests pass, Grafana on `localhost:3000` shows request rate and p95.
-- [ ] **Phase 2 — Bootstrap:** state bucket; `shipit-plan` and `shipit-apply` roles with the S3 state permissions above (incl. the `.tflock` key for both); assume-only users `github-ci-plan` and `github-ci-apply`; keys stored in the GitHub `plan` and `production` environments (Mori creates the keys and pastes them into GitHub himself). *Done when:* `terraform init` in `envs/dev` uses the S3 backend and concurrent plans wait on the lock.
+- [x] **Phase 2 — Bootstrap:** state bucket; `shipit-plan` and `shipit-apply` roles with the S3 state permissions above (incl. the `.tflock` key for both); assume-only users `github-ci-plan` and `github-ci-apply`; keys stored in the GitHub `plan` and `production` environments (Mori creates the keys and pastes them into GitHub himself). *Done when:* `terraform init` in `envs/dev` uses the S3 backend and concurrent plans wait on the lock.
 - [ ] **Phase 3 — Network + ECR:** VPC, 2 public subnets, IGW, routes, SGs, ECR (Mori writes the network module). *Done when:* apply succeeds and every route and rule can be explained.
 - [ ] **Phase 4 — Service:** DynamoDB, log group, IAM roles, ECS cluster/task/service, ALB, circuit breaker; first image pushed by hand. *Done when:* `curl http://<alb-dns>/health` returns 200 and notes survive a task restart.
 - [ ] **Phase 5 — App CI/CD:** `ci.yml`, `deploy.yml`. *Done when:* a merged change is live in about 5 min with no manual steps.
